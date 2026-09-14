@@ -13,8 +13,12 @@ pub struct Storage {
 
 impl Storage {
     pub fn new() -> Self {
-        let path = ProjectDirs::from("com", "HourTracker", "Hour Tracker")
-            .map(|dirs| dirs.data_local_dir().join("tracker.json"))
+        let path = std::env::var_os("TENTH_DATA_FILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                ProjectDirs::from("com", "HourTracker", "Hour Tracker")
+                    .map(|dirs| dirs.data_local_dir().join("tracker.json"))
+            })
             .unwrap_or_else(|| PathBuf::from("hour-tracker-data.json"));
         Self { path }
     }

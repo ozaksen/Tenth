@@ -72,6 +72,13 @@ impl TimeEntry {
     }
 
     pub fn update_manual_values(&mut self, date: NaiveDate, billed_tenths: i64) {
+        // Editing a note or project must not replace precise timer timestamps
+        // with a synthetic noon start and a rounded duration.
+        if self.started_at.with_timezone(&Local).date_naive() == date
+            && self.billed_tenths == billed_tenths.max(1)
+        {
+            return;
+        }
         let updated = Self::manual(self.project_id, date, billed_tenths);
         self.started_at = updated.started_at;
         self.ended_at = updated.ended_at;
@@ -169,6 +176,17 @@ mod tests {
         assert_eq!(entry.billed_tenths, 15);
         assert_eq!(entry.elapsed_seconds, 15 * BILLING_INCREMENT_SECONDS);
         assert_eq!(entry.note, "Prepared client update");
+    }
+
+    #[test]
+    fn unchanged_billing_preserves_precise_session_times() {
+        let start = Utc::now();
+        let end = start + chrono::Duration::seconds(61);
+        let mut entry = TimeEntry::from_session(Uuid::new_v4(), start, end);
+        entry.update_manual_values(start.with_timezone(&Local).date_naive(), 1);
+        assert_eq!(entry.started_at, start);
+        assert_eq!(entry.ended_at, end);
+        assert_eq!(entry.elapsed_seconds, 61);
     }
 
     #[test]

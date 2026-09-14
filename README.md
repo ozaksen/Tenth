@@ -29,7 +29,9 @@ Only one timer can run at a time. The active timer is saved immediately, so it c
 
 Use the theme control at the right side of the top bar to switch between light and dark appearances. Tenth remembers the selection for the next launch.
 
-When the app is minimized with a timer running, a translucent always-on-top reminder appears in the top-right corner. It shows the active project, elapsed and billable time, and lets you restore the app or stop and save the timer. Drag the reminder to move it temporarily; it disappears automatically when the app is restored or tracking stops.
+On macOS, Tenth lives in the menu bar while the app is running. The menu-bar title shows the live elapsed time, and its menu lets you start the selected project, stop and save, or restore the main window. Select **Compact timer ↗** below the running timer to show a translucent always-on-top reminder with the same essential controls on all platforms. On Windows and Linux, native minimization also opens the reminder. On macOS, the native yellow minimize button retains menu-bar tracking; use **Compact timer ↗** for the floating reminder. The reminder opens near the main window on its current display and can be dragged to another screen. It becomes more opaque on hover or focus; **Restore app** returns to the full window. macOS retains the menu-bar controls as well.
+
+The Timer view shows today’s saved billable hours across all projects and for the selected project. Editing only an entry’s note or project preserves the original exact timestamps and elapsed duration.
 
 ## Data storage
 
@@ -39,7 +41,7 @@ Data is stored as a readable JSON file in the operating system's per-user applic
 - Windows: `%LOCALAPPDATA%\\HourTracker\\Hour Tracker\\data\\tracker.json`
 - Linux: `$XDG_DATA_HOME/hour-tracker/tracker.json` (or `~/.local/share/hour-tracker/tracker.json`)
 
-Each save uses a temporary file and rename to reduce the chance of a partial write.
+Each save uses a temporary file and rename to reduce the chance of a partial write. Set `TENTH_DATA_FILE` to an absolute JSON path to use a separate data file, for example when testing the UI without touching your timesheets.
 
 ## Brand
 

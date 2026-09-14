@@ -7,8 +7,9 @@ use std::{
 use chrono::{Datelike, Days, Local, NaiveDate, Utc};
 use eframe::egui::{
     self, Align, Color32, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, Vec2,
-    ViewportBuilder, ViewportCommand, ViewportId,
+    ViewportCommand,
 };
+use eframe::egui::{ViewportBuilder, ViewportId};
 use uuid::Uuid;
 
 use crate::{
@@ -95,7 +96,7 @@ const LINE: ThemeColor = ThemeColor::new(
     Color32::from_rgb(57, 74, 76),
 );
 const TOOLBAR_CONTROL_HEIGHT: f32 = 36.0;
-const REMINDER_SIZE: Vec2 = Vec2::new(360.0, 104.0);
+const REMINDER_SIZE: Vec2 = Vec2::new(400.0, 124.0);
 const REMINDER_EDGE_GAP: f32 = 20.0;
 
 #[derive(PartialEq, Eq)]
@@ -119,10 +120,18 @@ pub struct HourTrackerApp {
     editing_entry: Option<Uuid>,
     edit_project: Option<Uuid>,
     edit_day: usize,
+    edit_week_start: NaiveDate,
     edit_tenths: i64,
     edit_note: String,
     entry_picker_cell: Option<(Uuid, u64)>,
     status: Option<(String, bool)>,
+    last_window_rect: Option<egui::Rect>,
+    reminder_origin: Option<egui::Pos2>,
+    compact_requested: bool,
+    #[cfg(target_os = "macos")]
+    menu_bar: Option<crate::macos_menu_bar::MacMenuBar>,
+    #[cfg(target_os = "macos")]
+    menu_bar_initialized: bool,
 }
 
 impl HourTrackerApp {
@@ -160,10 +169,18 @@ impl HourTrackerApp {
             editing_entry: None,
             edit_project: None,
             edit_day: 0,
+            edit_week_start: saturday_of(today),
             edit_tenths: 1,
             edit_note: String::new(),
             entry_picker_cell: None,
             status,
+            last_window_rect: None,
+            reminder_origin: None,
+            compact_requested: false,
+            #[cfg(target_os = "macos")]
+            menu_bar: None,
+            #[cfg(target_os = "macos")]
+            menu_bar_initialized: false,
         }
     }
 
@@ -200,6 +217,9 @@ impl HourTrackerApp {
     }
 
     fn start_timer(&mut self) {
+        if self.data.active_timer.is_some() {
+            return;
+        }
         let Some(project_id) = self.selected_project else {
             return;
         };
@@ -219,18 +239,36 @@ impl HourTrackerApp {
         entry.note = timer.note;
         self.data.entries.push(entry);
         self.timer_note.clear();
+        self.compact_requested = false;
         self.sort_entries();
         self.save("Entry saved");
     }
 
     fn minimized_reminder(&mut self, ctx: &egui::Context) {
-        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
-        let Some(timer) = self.data.active_timer.clone().filter(|_| minimized) else {
+        // macOS suppresses native redraws when a window is miniaturized.
+        // Create its floating viewport through the explicit Compact timer action
+        // before minimizing; the native yellow button retains menu-bar tracking.
+        let minimized = !cfg!(target_os = "macos")
+            && ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        if !minimized && let Some(rect) = ctx.input(|input| input.viewport().outer_rect) {
+            self.last_window_rect = Some(rect);
+        }
+        let Some(timer) = self
+            .data
+            .active_timer
+            .clone()
+            .filter(|_| minimized || self.compact_requested)
+        else {
+            self.reminder_origin = None;
             return;
         };
 
-        let monitor_size = ctx.input(|input| input.viewport().monitor_size);
-        let position = reminder_position(monitor_size, REMINDER_SIZE, REMINDER_EDGE_GAP);
+        // Anchor in the main window's desktop coordinates, including negative
+        // origins on displays to the left/above the primary display. Keep the
+        // initial builder position stable so repainting never undoes a drag.
+        let position = *self.reminder_origin.get_or_insert_with(|| {
+            reminder_position(self.last_window_rect, REMINDER_SIZE, REMINDER_EDGE_GAP)
+        });
         let project_name = self.project_name(timer.project_id).to_owned();
         let elapsed = (Utc::now() - timer.started_at).num_seconds().max(0);
         let reminder_id = ViewportId::from_hash_of("active_timer_reminder");
@@ -258,7 +296,13 @@ impl HourTrackerApp {
                             reminder_fill.r(),
                             reminder_fill.g(),
                             reminder_fill.b(),
-                            238,
+                            if reminder_ctx
+                                .input(|input| input.focused || input.pointer.hover_pos().is_some())
+                            {
+                                248
+                            } else {
+                                185
+                            },
                         ))
                         .stroke(Stroke::new(
                             1.0,
@@ -286,7 +330,7 @@ impl HourTrackerApp {
                         brand_mark(ui, 18.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                RichText::new(compact_message(&project_name, 28))
+                                RichText::new(compact_message(&project_name, 22))
                                     .size(13.0)
                                     .strong()
                                     .color(INK),
@@ -313,6 +357,7 @@ impl HourTrackerApp {
                             .button(RichText::new("Restore app").color(ACCENT_DARK))
                             .clicked()
                         {
+                            self.compact_requested = false;
                             reminder_ctx.send_viewport_cmd_to(
                                 ViewportId::ROOT,
                                 ViewportCommand::Minimized(false),
@@ -339,6 +384,53 @@ impl HourTrackerApp {
                     });
                 });
         });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_menu_bar(&mut self, ctx: &egui::Context) {
+        use crate::macos_menu_bar::{MacMenuBar, MenuBarAction};
+
+        if !self.menu_bar_initialized {
+            self.menu_bar_initialized = true;
+            match MacMenuBar::new(ctx) {
+                Ok(menu_bar) => self.menu_bar = Some(menu_bar),
+                Err(error) => self.status = Some((error, true)),
+            }
+        }
+
+        let selected_project_name = self
+            .selected_project
+            .map(|id| self.project_name(id).to_owned());
+        let active_timer = self.data.active_timer.as_ref().map(|timer| {
+            let elapsed = (Utc::now() - timer.started_at).num_seconds().max(0);
+            (
+                self.project_name(timer.project_id).to_owned(),
+                elapsed,
+                billed_tenths(elapsed),
+            )
+        });
+
+        if let Some(menu_bar) = &self.menu_bar {
+            menu_bar.update(
+                selected_project_name.as_deref(),
+                active_timer
+                    .as_ref()
+                    .map(|(project, elapsed, billable)| (project.as_str(), *elapsed, *billable)),
+            );
+        }
+
+        let action = self.menu_bar.as_ref().and_then(MacMenuBar::next_action);
+        match action {
+            Some(MenuBarAction::Start) if self.data.active_timer.is_none() => self.start_timer(),
+            Some(MenuBarAction::Stop) => self.stop_timer(),
+            Some(MenuBarAction::Open) => {
+                self.compact_requested = false;
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+            Some(MenuBarAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
+            _ => {}
+        }
     }
 
     fn add_manual_entry(&mut self) {
@@ -371,7 +463,8 @@ impl HourTrackerApp {
         let date = entry.started_at.with_timezone(&Local).date_naive();
         self.editing_entry = Some(entry.id);
         self.edit_project = Some(entry.project_id);
-        self.edit_day = (date - self.week_start).num_days().clamp(0, 6) as usize;
+        self.edit_week_start = saturday_of(date);
+        self.edit_day = days_from_saturday(date) as usize;
         self.edit_tenths = entry.billed_tenths;
         self.edit_note = entry.note.clone();
         self.entry_picker_cell = None;
@@ -381,7 +474,7 @@ impl HourTrackerApp {
         let (Some(entry_id), Some(project_id)) = (self.editing_entry, self.edit_project) else {
             return;
         };
-        let date = self.week_start + Days::new(self.edit_day as u64);
+        let date = self.edit_week_start + Days::new(self.edit_day as u64);
         let Some(entry) = self
             .data
             .entries
@@ -435,12 +528,7 @@ impl HourTrackerApp {
                         self.view = View::Week;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let theme_label = match (self.data.dark_mode, compact) {
-                            (true, true) => "☀",
-                            (true, false) => "☀  Light",
-                            (false, true) => "☾",
-                            (false, false) => "☾  Dark",
-                        };
+                        let theme_label = if self.data.dark_mode { "Light" } else { "Dark" };
                         if ui
                             .button(theme_label)
                             .on_hover_text(if self.data.dark_mode {
@@ -576,7 +664,7 @@ impl HourTrackerApp {
                 .color(MUTED),
         );
         self.compact_status(ui);
-        ui.add_space(24.0);
+        ui.add_space(16.0);
 
         let timer = self.data.active_timer.clone();
         let elapsed = timer
@@ -587,7 +675,7 @@ impl HourTrackerApp {
             .fill(SURFACE.into())
             .stroke(Stroke::new(1.0, LINE))
             .corner_radius(14.0)
-            .inner_margin(Margin::same(if compact { 18 } else { 28 }))
+            .inner_margin(Margin::same(if compact { 18 } else { 22 }))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.project_picker(ui);
@@ -613,12 +701,12 @@ impl HourTrackerApp {
                 if note_response.lost_focus() && self.data.active_timer.is_some() {
                     self.save("Timer note saved");
                 }
-                ui.add_space(if compact { 24.0 } else { 34.0 });
+                ui.add_space(if compact { 18.0 } else { 22.0 });
                 ui.vertical_centered(|ui| {
                     if let Some(timer) = &timer {
                         ui.label(
                             RichText::new(format!(
-                                "●  Tracking {}",
+                                "Tracking {}",
                                 self.project_name(timer.project_id)
                             ))
                             .size(13.0)
@@ -636,7 +724,7 @@ impl HourTrackerApp {
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(format_elapsed(elapsed))
-                            .font(FontId::monospace(if compact { 42.0 } else { 62.0 }))
+                            .font(FontId::monospace(if compact { 42.0 } else { 56.0 }))
                             .strong()
                             .color(INK),
                     );
@@ -648,7 +736,7 @@ impl HourTrackerApp {
                         .size(13.0)
                         .color(MUTED),
                     );
-                    ui.add_space(24.0);
+                    ui.add_space(16.0);
                     if timer.is_some() {
                         if primary_button(ui, "■  Stop & save", DANGER.into(), true).clicked() {
                             self.stop_timer();
@@ -663,6 +751,19 @@ impl HourTrackerApp {
                     {
                         self.start_timer();
                     }
+                    if timer.is_some() {
+                        ui.add_space(8.0);
+                        if ui
+                            .button("Compact timer ↗")
+                            .on_hover_text(
+                                "Show a translucent floating timer. Drag it to any screen.",
+                            )
+                            .clicked()
+                        {
+                            self.compact_requested = true;
+                            ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+                        }
+                    }
                     if self.selected_project.is_none() && timer.is_none() {
                         ui.add_space(8.0);
                         ui.label(
@@ -674,7 +775,46 @@ impl HourTrackerApp {
                 });
             });
 
-        ui.add_space(34.0);
+        ui.add_space(16.0);
+        let today = Local::now().date_naive();
+        let today_entries: Vec<_> = self
+            .data
+            .entries
+            .iter()
+            .filter(|entry| entry.started_at.with_timezone(&Local).date_naive() == today)
+            .collect();
+        let today_tenths: i64 = today_entries.iter().map(|entry| entry.billed_tenths).sum();
+        let project_tenths: i64 = today_entries
+            .iter()
+            .filter(|entry| Some(entry.project_id) == self.selected_project)
+            .map(|entry| entry.billed_tenths)
+            .sum();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("TODAY · SAVED")
+                    .size(11.0)
+                    .strong()
+                    .color(MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{:.1} h across all projects",
+                    today_tenths as f64 / 10.0
+                ))
+                .strong()
+                .color(INK),
+            );
+            if self.selected_project.is_some() {
+                ui.label(
+                    RichText::new(format!(
+                        "{:.1} h on this project",
+                        project_tenths as f64 / 10.0
+                    ))
+                    .color(MUTED),
+                );
+            }
+        });
+        ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("Recent entries")
@@ -1298,13 +1438,13 @@ impl HourTrackerApp {
                             });
                         ui.add_space(8.0);
                         ui.label(RichText::new("DAY").size(11.0).strong().color(MUTED));
-                        let selected_date = self.week_start + Days::new(self.edit_day as u64);
+                        let selected_date = self.edit_week_start + Days::new(self.edit_day as u64);
                         egui::ComboBox::from_id_salt("edit_entry_day")
                             .selected_text(selected_date.format("%A, %b %-d").to_string())
                             .width(ui.available_width())
                             .show_ui(ui, |ui| {
                                 for day in 0..7 {
-                                    let date = self.week_start + Days::new(day);
+                                    let date = self.edit_week_start + Days::new(day);
                                     ui.selectable_value(
                                         &mut self.edit_day,
                                         day as usize,
@@ -1485,6 +1625,8 @@ impl eframe::App for HourTrackerApp {
         if self.data.active_timer.is_some() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
+        #[cfg(target_os = "macos")]
+        self.macos_menu_bar(ctx);
         self.minimized_reminder(ctx);
         self.top_bar(ctx);
         egui::CentralPanel::default()
@@ -1506,9 +1648,13 @@ impl eframe::App for HourTrackerApp {
     }
 }
 
-fn reminder_position(monitor_size: Option<Vec2>, reminder_size: Vec2, gap: f32) -> egui::Pos2 {
-    let monitor_size = monitor_size.unwrap_or(Vec2::new(1280.0, 720.0));
-    egui::pos2((monitor_size.x - reminder_size.x - gap).max(gap), gap)
+// Use the known window rectangle rather than a monitor size without an origin.
+fn reminder_position(window: Option<egui::Rect>, size: Vec2, gap: f32) -> egui::Pos2 {
+    let window = window.unwrap_or_else(|| egui::Rect::from_min_size(egui::pos2(40.0, 40.0), size));
+    egui::pos2(
+        (window.right() - size.x - gap).max(window.left()),
+        window.top() + gap,
+    )
 }
 
 fn days_from_saturday(date: NaiveDate) -> u32 {
@@ -1716,18 +1862,16 @@ mod tests {
     }
 
     #[test]
-    fn reminder_starts_at_the_top_right_and_stays_on_screen() {
-        assert_eq!(
-            reminder_position(
-                Some(Vec2::new(1920.0, 1080.0)),
-                Vec2::new(360.0, 104.0),
-                20.0,
-            ),
-            egui::pos2(1540.0, 20.0)
-        );
-        assert_eq!(
-            reminder_position(Some(Vec2::new(320.0, 240.0)), Vec2::new(360.0, 104.0), 20.0,),
-            egui::pos2(20.0, 20.0)
-        );
+    fn reminder_uses_the_window_display_including_negative_origins() {
+        for origin in [
+            egui::pos2(1920.0, 100.0),
+            egui::pos2(-1600.0, -900.0),
+            egui::pos2(100.0, 80.0),
+        ] {
+            let window = egui::Rect::from_min_size(origin, Vec2::new(980.0, 680.0));
+            let position = reminder_position(Some(window), REMINDER_SIZE, REMINDER_EDGE_GAP);
+            assert!(window.contains_rect(egui::Rect::from_min_size(position, REMINDER_SIZE)));
+            assert_eq!(position.y, origin.y + REMINDER_EDGE_GAP);
+        }
     }
 }
